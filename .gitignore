@@ -45,5 +45,4 @@ nul
 .env.local
 credentials.json
 
-# Claude Code
-.claude/
+
