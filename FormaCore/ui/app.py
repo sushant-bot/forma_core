@@ -39,6 +39,10 @@ from visualize.plot import BoardVisualizer
 from controller.api import BoardController
 from assistant.actions import get_ui_actions, ACTION_REGISTRY
 from assistant.validator import validate_action
+from workflow.copilot import analyze_board, DesignInsight
+from workflow.report import generate_report
+from workflow.memory import ProjectMemory
+from workflow.package import prepare_submission
 
 
 # ------------------------------------------------------------------ #
@@ -1011,15 +1015,57 @@ def main():
     early_stop = _fc['early_stop']
 
     # ============================================================== #
+    # PROJECT MEMORY & COPILOT
+    # ============================================================== #
+
+    # Initialize project memory
+    if 'project_memory' not in st.session_state:
+        st.session_state['project_memory'] = ProjectMemory()
+    memory: ProjectMemory = st.session_state['project_memory']
+
+    # Log optimization if this was a fresh run
+    if run_btn:
+        w_dict = None
+        if best_genome and hasattr(best_genome, 'weights'):
+            w = best_genome.weights
+            w_dict = {
+                'step': w.step, 'bend': w.bend, 'via': w.via,
+                'heat': w.heat, 'congestion': w.congestion,
+            }
+        memory.log_optimization(
+            naive_routed=n_naive, naive_total=total,
+            ga_routed=n_opt, ga_total=total,
+            naive_vias=naive_result.total_vias,
+            ga_vias=ga_result.total_vias,
+            naive_trace=naive_result.total_trace_length,
+            ga_trace=ga_result.total_trace_length,
+            ga_generations=len(gen_log),
+            ga_time=ga_time,
+            weights=w_dict,
+        )
+
+    # Run Copilot analysis
+    insights = analyze_board(
+        ga_grid, nets, naive_result, ga_result, gen_log,
+    )
+
+    # Compute system scores (used by multiple tabs)
+    scores = compute_system_score(
+        naive_result, ga_result, total, ga_time
+    )
+
+    # ============================================================== #
     # RESULTS TABS
     # ============================================================== #
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "PCB Comparison",
         "Optimization Details",
         "System Score",
-        "Export",
+        "Export & Reports",
         "Assistant",
+        "Design Copilot",
+        "Project Timeline",
     ])
 
     # ================================================================ #
@@ -1315,9 +1361,6 @@ def main():
     # TAB 3: SYSTEM SCORE
     # ================================================================ #
     with tab3:
-        scores = compute_system_score(
-            naive_result, ga_result, total, ga_time
-        )
         overall = scores['overall']
         sc = get_score_class(overall)
         sl = get_score_label(overall)
@@ -1566,6 +1609,87 @@ def main():
             mime="text/plain",
             use_container_width=True,
         )
+
+        # ----- Design Report Generation ----- #
+        st.markdown('<hr class="styled-divider">', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-header">Design Report</div>',
+            unsafe_allow_html=True
+        )
+
+        report_cols = st.columns(2)
+        with report_cols[0]:
+            md_report = generate_report(
+                ga_grid, nets, naive_result, ga_result, gen_log,
+                best_genome, naive_time, ga_time, insights, scores,
+                fmt='markdown',
+            )
+            st.download_button(
+                label="Download Report (Markdown)",
+                data=md_report,
+                file_name="formacore_report.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+        with report_cols[1]:
+            txt_full_report = generate_report(
+                ga_grid, nets, naive_result, ga_result, gen_log,
+                best_genome, naive_time, ga_time, insights, scores,
+                fmt='text',
+            )
+            st.download_button(
+                label="Download Full Report (TXT)",
+                data=txt_full_report,
+                file_name="formacore_full_report.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
+
+        # ----- Submission Package ----- #
+        st.markdown('<hr class="styled-divider">', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="section-header">Submission Package</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            "One-click export: report + images + data + timeline, "
+            "bundled as a ZIP file."
+        )
+
+        if st.button(
+            "Prepare Submission Package (ZIP)",
+            use_container_width=True,
+            type="primary",
+            key="submission_pkg_btn",
+        ):
+            with st.spinner("Building submission package..."):
+                zip_bytes = prepare_submission(
+                    grid=ga_grid,
+                    nets=nets,
+                    naive_result=naive_result,
+                    ga_result=ga_result,
+                    naive_grid=naive_grid,
+                    ga_grid=ga_grid,
+                    gen_log=gen_log,
+                    best_genome=best_genome,
+                    naive_time=naive_time,
+                    ga_time=ga_time,
+                    insights=insights,
+                    scores=scores,
+                    memory=memory,
+                )
+                st.session_state['submission_zip'] = zip_bytes
+                memory.log_export('submission_package',
+                                  'formacore_submission.zip')
+
+        if 'submission_zip' in st.session_state:
+            st.download_button(
+                label="Download Submission Package (ZIP)",
+                data=st.session_state['submission_zip'],
+                file_name="formacore_submission.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
 
     # ================================================================ #
     # TAB 5: ASSISTANT
@@ -1917,6 +2041,249 @@ def main():
                 mime="application/json",
                 use_container_width=True,
             )
+
+    # ================================================================ #
+    # TAB 6: DESIGN COPILOT
+    # ================================================================ #
+    with tab6:
+        st.markdown(
+            '<div class="section-header">Design Insight Copilot</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            "Rule-based analysis of your routing results. "
+            "Raw metrics converted into actionable feedback."
+        )
+
+        if not insights:
+            st.success("No issues detected. Your design looks clean.")
+        else:
+            # Summary counts
+            n_crit = sum(1 for i in insights if i.severity == 'critical')
+            n_warn = sum(1 for i in insights if i.severity == 'warning')
+            n_info = sum(1 for i in insights if i.severity == 'info')
+
+            summary_cols = st.columns(3)
+            with summary_cols[0]:
+                st.markdown(render_metric_card(
+                    "Critical", str(n_crit),
+                ), unsafe_allow_html=True)
+            with summary_cols[1]:
+                st.markdown(render_metric_card(
+                    "Warnings", str(n_warn),
+                ), unsafe_allow_html=True)
+            with summary_cols[2]:
+                st.markdown(render_metric_card(
+                    "Info", str(n_info),
+                ), unsafe_allow_html=True)
+
+            st.markdown(
+                '<hr class="styled-divider">',
+                unsafe_allow_html=True
+            )
+
+            # Filter by category
+            categories = sorted(
+                set(i.category for i in insights)
+            )
+            cat_filter = st.multiselect(
+                "Filter by category",
+                categories,
+                default=categories,
+                key="copilot_cat_filter",
+            )
+
+            for ins in insights:
+                if ins.category not in cat_filter:
+                    continue
+
+                if ins.severity == 'critical':
+                    color = '#ef4444'
+                    badge = 'CRITICAL'
+                elif ins.severity == 'warning':
+                    color = '#f59e0b'
+                    badge = 'WARNING'
+                else:
+                    color = '#6366f1'
+                    badge = 'INFO'
+
+                st.markdown(f"""
+                <div style="
+                    border-left: 4px solid {color};
+                    padding: 12px 16px;
+                    margin: 8px 0;
+                    background: rgba(255,255,255,0.03);
+                    border-radius: 0 8px 8px 0;
+                ">
+                    <div style="display:flex;align-items:center;gap:8px;
+                                margin-bottom:6px;">
+                        <span style="
+                            background:{color};
+                            color:white;
+                            padding:2px 8px;
+                            border-radius:4px;
+                            font-size:0.7rem;
+                            font-weight:700;
+                        ">{badge}</span>
+                        <span style="
+                            color:{color};
+                            font-size:0.75rem;
+                            text-transform:uppercase;
+                        ">{ins.category}</span>
+                    </div>
+                    <div style="font-weight:600;font-size:0.95rem;
+                                margin-bottom:4px;">
+                        {ins.title}
+                    </div>
+                    <div style="font-size:0.85rem;opacity:0.85;
+                                margin-bottom:8px;">
+                        {ins.message}
+                    </div>
+                    <div style="
+                        font-size:0.8rem;
+                        padding:8px 12px;
+                        background:rgba(99,102,241,0.1);
+                        border-radius:6px;
+                        border:1px solid rgba(99,102,241,0.2);
+                    ">
+                        Suggestion: {ins.suggestion}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    # ================================================================ #
+    # TAB 7: PROJECT TIMELINE
+    # ================================================================ #
+    with tab7:
+        st.markdown(
+            '<div class="section-header">Project Timeline</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            "Automatic knowledge capture: every optimization, "
+            "assistant action, and export is logged with context."
+        )
+
+        # Add note form
+        with st.expander("Add a Design Note"):
+            note_title = st.text_input(
+                "Title", key="memory_note_title",
+                placeholder="e.g. Changed layout strategy",
+            )
+            note_text = st.text_area(
+                "Note", key="memory_note_text",
+                placeholder="Describe what you changed and why...",
+            )
+            if st.button("Save Note", key="memory_save_note"):
+                if note_title and note_text:
+                    memory.log_note(note_title, note_text)
+                    st.success("Note saved to timeline.")
+                    st.rerun()
+
+        st.markdown(
+            '<hr class="styled-divider">',
+            unsafe_allow_html=True
+        )
+
+        timeline = memory.get_timeline()
+
+        if not timeline:
+            st.info("No events recorded yet. Run an optimization to start.")
+        else:
+            # Display event count
+            st.markdown(render_metric_card(
+                "Events", str(len(timeline)),
+            ), unsafe_allow_html=True)
+
+            st.markdown(
+                '<hr class="styled-divider">',
+                unsafe_allow_html=True
+            )
+
+            # Timeline display
+            type_icons = {
+                'optimization': 'OPT',
+                'assistant': 'AST',
+                'parameter': 'CFG',
+                'export': 'EXP',
+                'note': 'NOTE',
+            }
+            type_colors = {
+                'optimization': '#6366f1',
+                'assistant': '#10b981',
+                'parameter': '#f59e0b',
+                'export': '#8b5cf6',
+                'note': '#06b6d4',
+            }
+
+            for entry in reversed(timeline):
+                etype = entry['type']
+                icon = type_icons.get(etype, etype.upper()[:3])
+                color = type_colors.get(etype, '#6b7280')
+
+                st.markdown(f"""
+                <div style="
+                    display:flex;
+                    gap:12px;
+                    padding:10px 0;
+                    border-bottom:1px solid rgba(255,255,255,0.06);
+                ">
+                    <div style="
+                        min-width:50px;
+                        text-align:center;
+                    ">
+                        <span style="
+                            background:{color};
+                            color:white;
+                            padding:3px 8px;
+                            border-radius:4px;
+                            font-size:0.65rem;
+                            font-weight:700;
+                        ">{icon}</span>
+                    </div>
+                    <div style="flex:1;">
+                        <div style="
+                            font-weight:600;
+                            font-size:0.9rem;
+                            margin-bottom:2px;
+                        ">{entry['title']}</div>
+                        <div style="
+                            font-size:0.8rem;
+                            opacity:0.75;
+                        ">{entry['description']}</div>
+                        <div style="
+                            font-size:0.7rem;
+                            opacity:0.5;
+                            margin-top:4px;
+                        ">{entry['timestamp']}</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # Export timeline
+        st.markdown(
+            '<hr class="styled-divider">',
+            unsafe_allow_html=True
+        )
+        export_cols = st.columns(2)
+        with export_cols[0]:
+            if memory.count > 0:
+                st.download_button(
+                    label="Export Timeline (JSON)",
+                    data=memory.export_json(),
+                    file_name="formacore_timeline.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+        with export_cols[1]:
+            if memory.count > 0:
+                st.download_button(
+                    label="Export Summary (TXT)",
+                    data=memory.get_summary(),
+                    file_name="formacore_session_summary.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
 
 
 if __name__ == "__main__":
