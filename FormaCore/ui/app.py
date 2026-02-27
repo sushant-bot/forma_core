@@ -43,6 +43,8 @@ from workflow.copilot import analyze_board, DesignInsight
 from workflow.report import generate_report
 from workflow.memory import ProjectMemory
 from workflow.package import prepare_submission
+from kicad_interface.parser import parse_kicad_sch as _parse_sch
+from kicad_interface.converter import convert_schematic
 
 
 # ------------------------------------------------------------------ #
@@ -856,7 +858,7 @@ def main():
 
     source = st.sidebar.radio(
         "Board Source",
-        ["Sample Board", "Upload .kicad_pcb"],
+        ["Sample Board", "Upload KiCad File"],
         index=0
     )
 
@@ -873,21 +875,51 @@ def main():
     grid = None
     nets = None
 
-    if source == "Upload .kicad_pcb":
+    if source == "Upload KiCad File":
         uploaded = st.sidebar.file_uploader(
-            "Upload KiCad PCB file", type=["kicad_pcb"]
+            "Upload KiCad design file",
+            type=["kicad_sch", "kicad_pcb"],
+            help="Supports .kicad_sch (schematic) and .kicad_pcb (PCB layout) files",
         )
         if uploaded:
             try:
                 content = uploaded.read().decode('utf-8')
-                grid, nets = parse_kicad_pcb(content)
-                st.sidebar.success(
-                    f"Parsed: {len(grid.components)} components, "
-                    f"{len(nets)} nets"
-                )
+                fname = uploaded.name.lower()
+
+                if fname.endswith('.kicad_sch'):
+                    sch = _parse_sch(content)
+                    result = convert_schematic(sch)
+                    grid = result.grid
+                    nets = result.nets
+                    st.sidebar.success(
+                        f"**{sch.title or uploaded.name}**\n\n"
+                        f"Components: {result.stats['board_components']} "
+                        f"(of {result.stats['total_sch_components']})\n\n"
+                        f"Nets: {result.stats['total_nets']}\n\n"
+                        f"Board: {result.stats['board_size']} grid "
+                        f"({result.stats['board_mm']})"
+                    )
+                    if result.skipped_nets:
+                        st.sidebar.caption(
+                            f"{result.stats['skipped_nets']} nets skipped "
+                            f"(< 2 routable pins)"
+                        )
+                elif fname.endswith('.kicad_pcb'):
+                    grid, nets = parse_kicad_pcb(content)
+                    st.sidebar.success(
+                        f"Parsed: {len(grid.components)} components, "
+                        f"{len(nets)} nets"
+                    )
+                else:
+                    st.sidebar.error("Unsupported file type")
             except Exception as e:
                 st.sidebar.error(f"Parse error: {e}")
                 grid, nets = None, None
+        else:
+            st.sidebar.info(
+                "Upload a `.kicad_sch` (schematic) or "
+                "`.kicad_pcb` (PCB layout) file to route."
+            )
     else:
         grid, nets = create_sample_board()
         st.sidebar.info(

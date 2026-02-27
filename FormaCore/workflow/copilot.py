@@ -457,7 +457,7 @@ def _analyze_convergence(
     if not gen_log or len(gen_log) < 3:
         return out
 
-    best_scores = [g['best_fitness'] for g in gen_log]
+    best_scores = [g.get('best_fitness', g.get('best', 0)) for g in gen_log]
     total_gens = len(best_scores)
 
     # Check if early stopping kicked in
