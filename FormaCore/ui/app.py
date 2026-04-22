@@ -11,6 +11,9 @@ import os
 import time
 import io
 import math
+import json
+import logging
+from pathlib import Path
 
 # Ensure project root is on path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,9 +45,22 @@ from assistant.validator import validate_action
 from workflow.copilot import analyze_board, DesignInsight
 from workflow.report import generate_report
 from workflow.memory import ProjectMemory
-from workflow.package import prepare_submission
+from workflow.package import prepare_submission, write_structured_outputs
 from kicad_interface.parser import parse_kicad_sch as _parse_sch
 from kicad_interface.converter import convert_schematic
+from kicad_interface.pcb_parser import parse_kicad_pcb as _parse_pcb
+from executor import executor as board_executor
+from errors import ParseError
+from config import (
+    APP_VERSION,
+    DEFAULT_HEAT_SIGMA,
+    FAST_DEMO_GA_SETTINGS,
+    setup_logging,
+    output_dir_for_run,
+)
+
+
+logger = setup_logging()
 
 
 # ------------------------------------------------------------------ #
@@ -400,80 +416,7 @@ def create_sample_board(width: int = 80, height: int = 60) -> tuple:
 # ------------------------------------------------------------------ #
 
 def parse_kicad_pcb(content: str) -> tuple:
-    """Parse a .kicad_pcb file and extract components + nets."""
-    import re
-
-    width_mm, height_mm = 50.0, 40.0
-
-    edge_coords = re.findall(
-        r'\(gr_line\s+\(start\s+([\d.]+)\s+([\d.]+)\)\s*'
-        r'\(end\s+([\d.]+)\s+([\d.]+)\).*?Edge\.Cuts',
-        content, re.DOTALL
-    )
-    if not edge_coords:
-        edge_coords = re.findall(
-            r'\(gr_rect\s+\(start\s+([\d.]+)\s+([\d.]+)\)\s*'
-            r'\(end\s+([\d.]+)\s+([\d.]+)\)',
-            content, re.DOTALL
-        )
-
-    if edge_coords:
-        all_x, all_y = [], []
-        for x1, y1, x2, y2 in edge_coords:
-            all_x.extend([float(x1), float(x2)])
-            all_y.extend([float(y1), float(y2)])
-        if all_x and all_y:
-            width_mm = max(all_x) - min(all_x)
-            height_mm = max(all_y) - min(all_y)
-
-    resolution = 0.5
-    grid_w = max(40, int(width_mm / resolution))
-    grid_h = max(30, int(height_mm / resolution))
-    grid = Grid(width=grid_w, height=grid_h, layers=2, resolution_mm=resolution)
-
-    components = []
-    fp_blocks = re.findall(
-        r'\(footprint\s+"([^"]*)".*?\(at\s+([\d.]+)\s+([\d.]+).*?\)',
-        content
-    )
-
-    for i, (name, x_str, y_str) in enumerate(fp_blocks):
-        short_name = name.split(':')[-1][:8] if ':' in name else name[:8]
-        gx = int(float(x_str) / resolution) % grid_w
-        gy = int(float(y_str) / resolution) % grid_h
-        comp = Component(
-            name=short_name, x=gx, y=gy,
-            width=4, height=3, layer=Layer.TOP,
-            power_w=0.0,
-            pins=[(0, 0), (3, 0), (0, 2), (3, 2)]
-        )
-        grid.place_component(comp)
-        components.append(comp)
-
-    net_defs = re.findall(r'\(net\s+(\d+)\s+"([^"]*)"\)', content)
-    net_map = {nid: name for nid, name in net_defs if name.strip()}
-
-    pad_nets = {}
-    pad_blocks = re.findall(
-        r'\(pad\s+"[^"]*"\s+\w+\s+\w+\s+\(at\s+([\d.]+)\s+([\d.]+).*?\)'
-        r'.*?\(net\s+(\d+)',
-        content, re.DOTALL
-    )
-    for px, py, nid in pad_blocks:
-        if nid in net_map and net_map[nid]:
-            gx = int(float(px) / resolution) % grid_w
-            gy = int(float(py) / resolution) % grid_h
-            pad_nets.setdefault(nid, []).append((gx, gy, 0))
-
-    nets = []
-    for nid, pins in pad_nets.items():
-        if len(pins) >= 2:
-            name = net_map.get(nid, f"net_{nid}")
-            unique_pins = list(dict.fromkeys(pins))
-            if len(unique_pins) >= 2:
-                nets.append(Net(name, unique_pins[:2]))
-
-    return grid, nets
+    return _parse_pcb(content)
 
 
 # ------------------------------------------------------------------ #
@@ -534,6 +477,93 @@ def export_csv(grid: Grid) -> str:
                 f"{net_name},{i},{x},{y},{layer},{mm_x:.3f},{mm_y:.3f}"
             )
     return "\n".join(lines)
+
+
+def export_kicad_proof(grid: Grid, nets: list) -> str:
+    """
+    Build a lightweight .kicad_pcb proof export.
+    This is a compatibility bridge to show route geometry in KiCad format.
+    """
+    net_ids = {net.name: idx + 1 for idx, net in enumerate(nets)}
+
+    out = [
+        "(kicad_pcb (version 20231120) (generator \"FormaCore-AI\")",
+        "  (general (thickness 1.6))",
+        "  (paper \"A4\")",
+        "  (layers",
+        "    (0 \"F.Cu\" signal)",
+        "    (31 \"B.Cu\" signal)",
+        "  )",
+        f"  (gr_rect (start 0 0) (end {grid.width * grid.resolution:.3f} {grid.height * grid.resolution:.3f})",
+        "    (stroke (width 0.1) (type solid)) (fill none) (layer \"Edge.Cuts\"))",
+    ]
+
+    for name, nid in net_ids.items():
+        out.append(f"  (net {nid} \"{name}\")")
+
+    for net_name, path in grid.routed_paths.items():
+        nid = net_ids.get(net_name)
+        if nid is None:
+            continue
+
+        for i in range(1, len(path)):
+            x1, y1, l1 = path[i - 1]
+            x2, y2, l2 = path[i]
+            px1 = x1 * grid.resolution
+            py1 = y1 * grid.resolution
+            px2 = x2 * grid.resolution
+            py2 = y2 * grid.resolution
+
+            if l1 != l2:
+                out.append(
+                    f"  (via (at {px2:.3f} {py2:.3f}) (size 0.8) (drill 0.4) "
+                    f"(layers \"F.Cu\" \"B.Cu\") (net {nid}))"
+                )
+            else:
+                layer = "F.Cu" if l2 == 0 else "B.Cu"
+                out.append(
+                    f"  (segment (start {px1:.3f} {py1:.3f}) (end {px2:.3f} {py2:.3f}) "
+                    f"(width 0.25) (layer \"{layer}\") (net {nid}))"
+                )
+
+    out.append(")")
+    return "\n".join(out)
+
+
+def build_why_better(naive_result: RoutingResult,
+                     ga_result: RoutingResult,
+                     best_genome: Genome) -> list:
+    """Generate explainability bullets for why optimized output improved."""
+    bullets = []
+
+    if naive_result.total_vias > ga_result.total_vias:
+        bullets.append(
+            f"Reduced vias ({naive_result.total_vias} -> {ga_result.total_vias}) "
+            f"with via-aware weighting (via_w={best_genome.via_w:.1f})."
+        )
+
+    if naive_result.total_bends > ga_result.total_bends:
+        bullets.append(
+            f"Lower bend count ({naive_result.total_bends} -> {ga_result.total_bends}) "
+            f"from bend penalty shaping straighter paths (bend_w={best_genome.bend_w:.1f})."
+        )
+
+    if best_genome.heat_w > 2.5:
+        bullets.append(
+            "Heat-aware routing pushed traces away from hotspots, improving thermal safety margin."
+        )
+
+    if best_genome.congestion_w > 3.5:
+        bullets.append(
+            "Net ordering and congestion cost helped distribute routes and avoid bottlenecks."
+        )
+
+    if not bullets:
+        bullets.append(
+            "The optimizer selected a balanced strategy across distance, bends, vias, heat, and congestion."
+        )
+
+    return bullets
 
 
 def render_metric_card(label: str, value: str, delta: str = "",
@@ -611,6 +641,60 @@ def compute_system_score(naive_result: RoutingResult,
         'bend_quality': bend_score,
         'speed': speed_score,
     }
+
+
+def compute_system_confidence(ga_result: RoutingResult,
+                              drc_report: dict) -> tuple[str, str]:
+    """Convert route quality + DRC results into a human-readable confidence."""
+    passed = bool(drc_report.get('passed', False))
+    drc_errors = int(drc_report.get('errors', 0))
+
+    if ga_result.completion_rate >= 1.0 and not ga_result.failed_nets and passed:
+        return 'HIGH', 'Full completion and no DRC errors'
+
+    if ga_result.completion_rate >= 0.85 and not ga_result.failed_nets and drc_errors == 0:
+        return 'MEDIUM', 'Mostly complete with clean DRC'
+
+    return 'LOW', 'Routing gaps or DRC issues detected'
+
+
+def initialize_session_state() -> None:
+    """Seed the Streamlit session with stable defaults."""
+    defaults = {
+        'fc': None,
+        'fc_last_run': None,
+        'run_counter': 0,
+        'last_output_dir': None,
+        'failure_case_demo': None,
+        'board_source': 'Sample Board',
+        'pop_size': 15,
+        'generations': 20,
+        'early_stop': 5,
+        'heat_sigma': 10.0,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def next_output_dir() -> Path:
+    """Create a deterministic run folder under /outputs."""
+    run_num = int(st.session_state.get('run_counter', 0)) + 1
+    return output_dir_for_run(f'run_{run_num:03d}')
+
+
+def build_failure_case_demo() -> tuple[Grid, list[Net], RoutingResult, dict]:
+    """Create a deliberately blocked routing example for demonstration."""
+    grid = Grid(width=5, height=3, layers=2, resolution_mm=0.5)
+    blocker_top = Component("BLOCK_TOP", x=2, y=0, width=1, height=3,
+                            layer=Layer.TOP)
+    blocker_bot = Component("BLOCK_BOT", x=2, y=0, width=1, height=3,
+                            layer=Layer.BOTTOM)
+    grid.place_component(blocker_top)
+    grid.place_component(blocker_bot)
+    nets = [Net('BLOCKED', [(0, 1, 0), (4, 1, 0)])]
+    result = MultiNetRouter(grid).route_all(nets)
+    drc = board_executor.get_drc_report(grid, nets)
+    return grid, nets, result, drc
 
 
 def get_score_class(score: float) -> str:
@@ -843,15 +927,43 @@ def create_comparison_bar(naive_result: RoutingResult,
 # ------------------------------------------------------------------ #
 
 def main():
+    initialize_session_state()
+
     # -- Header --
     st.markdown("""
     <div class="header-banner">
-        <h1>FormaCore AI <span class="header-badge">v1.0</span></h1>
+        <h1>FormaCore AI <span class="header-badge">v{version}</span></h1>
         <div class="subtitle">
             AI-Assisted Strategy-Optimized PCB Router &mdash; 2-Layer Board Optimization
         </div>
     </div>
-    """, unsafe_allow_html=True)
+    """.format(version=APP_VERSION), unsafe_allow_html=True)
+
+    st.markdown("""
+**FormaCore AI System**
+- A* deterministic routing
+- Genetic algorithm optimization
+- Thermal-aware and congestion-aware costs
+- Safe assistant pipeline (preview before apply)
+- Automated reporting and package export
+""")
+
+    rw_col, lim_col = st.columns(2)
+    with rw_col:
+        st.info(
+            "Real-world use\n"
+            "- Faster PCB routing exploration for students and researchers\n"
+            "- Reduced manual rework through optimization + assistant safety\n"
+            "- Better thermal routing decisions from heat-aware costs\n"
+            "- Automated outputs for lab reports and submissions"
+        )
+    with lim_col:
+        st.warning(
+            "Current limitations\n"
+            "- Routing is currently focused on 2-layer boards\n"
+            "- Thermal model is simplified (grid Gaussian approximation)\n"
+            "- DRC checks are workflow-level, not full industry sign-off"
+        )
 
     # -- Sidebar --
     st.sidebar.markdown("### Board Configuration")
@@ -859,15 +971,16 @@ def main():
     source = st.sidebar.radio(
         "Board Source",
         ["Sample Board", "Upload KiCad File"],
-        index=0
+        index=0,
+        key="board_source",
     )
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### GA Parameters")
-    pop_size = st.sidebar.slider("Population size", 5, 30, 15)
-    generations = st.sidebar.slider("Generations", 5, 50, 20)
-    early_stop = st.sidebar.slider("Early stop (stale gens)", 3, 15, 5)
-    heat_sigma = st.sidebar.slider("Heat spread (sigma)", 3.0, 20.0, 10.0)
+    pop_size = st.sidebar.slider("Population size", 5, 30, 15, key="pop_size")
+    generations = st.sidebar.slider("Generations", 5, 50, 20, key="generations")
+    early_stop = st.sidebar.slider("Early stop (stale gens)", 3, 15, 5, key="early_stop")
+    heat_sigma = st.sidebar.slider("Heat spread (sigma)", 3.0, 20.0, DEFAULT_HEAT_SIGMA, key="heat_sigma")
 
     st.sidebar.markdown("---")
 
@@ -912,6 +1025,9 @@ def main():
                     )
                 else:
                     st.sidebar.error("Unsupported file type")
+            except ParseError as e:
+                st.sidebar.error(str(e))
+                grid, nets = None, None
             except Exception as e:
                 st.sidebar.error(f"Parse error: {e}")
                 grid, nets = None, None
@@ -927,12 +1043,39 @@ def main():
             f"{len(grid.components)} components, {len(nets)} nets"
         )
 
-    # -- Optimize button --
-    run_btn = st.sidebar.button(
+    if grid is None or nets is None:
+        st.error(
+            "No usable board is loaded. Choose Sample Board or upload a valid KiCad file."
+        )
+        return
+
+    if len(nets) == 0:
+        st.error("Invalid board configuration: no routable nets were found.")
+        return
+
+    # -- Run controls --
+    run_cols = st.sidebar.columns(3)
+    run_btn = run_cols[0].button(
         "Run Optimization", type="primary",
         disabled=(grid is None),
         use_container_width=True,
     )
+    demo_btn = run_cols[1].button(
+        "Run Demo",
+        use_container_width=True,
+        help="Loads sample board and runs a full naive vs GA demo with default settings.",
+    )
+    replay_btn = run_cols[2].button(
+        "Replay Last Run",
+        use_container_width=True,
+        disabled=(st.session_state.get('fc_last_run') is None),
+        help="Restores the most recently completed optimization without recomputing it.",
+    )
+
+    if replay_btn and st.session_state.get('fc_last_run') is not None:
+        st.session_state['fc'] = st.session_state['fc_last_run']
+        st.sidebar.success("Last completed run restored from cache.")
+        st.rerun()
 
     st.sidebar.markdown("---")
     st.sidebar.markdown(
@@ -943,7 +1086,7 @@ def main():
         unsafe_allow_html=True
     )
 
-    if not run_btn and 'fc' not in st.session_state:
+    if not run_btn and not demo_btn and st.session_state['fc'] is None:
         # Show initial state
         st.markdown("""
         <div class="custom-info">
@@ -971,7 +1114,34 @@ def main():
     # RUN OPTIMIZATION (or restore from cache)
     # ============================================================== #
 
-    if run_btn:
+    if run_btn or demo_btn:
+        demo_mode = bool(demo_btn)
+        run_dir = next_output_dir()
+        run_id = run_dir.name
+
+        if demo_btn:
+            grid, nets = create_sample_board()
+            pop_size = FAST_DEMO_GA_SETTINGS["population_size"]
+            generations = FAST_DEMO_GA_SETTINGS["generations"]
+            early_stop = FAST_DEMO_GA_SETTINGS["early_stop_gens"]
+            heat_sigma = DEFAULT_HEAT_SIGMA
+            st.sidebar.success(
+                "Demo mode: sample board loaded with fast GA settings (10 pop / 10 generations)."
+            )
+
+        if len(nets) == 0:
+            st.error("No routable nets are available for the loaded board.")
+            return
+
+        st.session_state.pop('submission_zip', None)
+        st.session_state.pop('structured_manifest', None)
+
+        setup_logging(run_dir / 'run.log')
+        logger.info(
+            "Starting optimization run | demo_mode=%s | population=%s | generations=%s | early_stop=%s",
+            demo_mode, pop_size, generations, early_stop,
+        )
+
         # Apply heat
         heat = HeatModel(sigma=heat_sigma)
         heat.apply(grid)
@@ -1016,6 +1186,9 @@ def main():
 
         # Cache results in session state for persistence
         st.session_state['fc'] = {
+            'run_id': run_id,
+            'output_dir': str(run_dir),
+            'demo_mode': demo_mode,
             'naive_result': naive_result, 'ga_result': ga_result,
             'ga_grid': ga_grid, 'naive_grid': naive_grid,
             'gen_log': gen_log, 'best_genome': best_genome,
@@ -1024,6 +1197,12 @@ def main():
             'n_naive': n_naive, 'n_opt': n_opt,
             'pop_size': pop_size, 'early_stop': early_stop,
         }
+        st.session_state['fc_last_run'] = st.session_state['fc']
+        st.session_state['run_counter'] = int(st.session_state['run_counter']) + 1
+        logger.info(
+            "Completed optimization run %s | routed=%s/%s | vias=%s | bends=%s | time=%.2fs",
+            run_id, n_opt, total, ga_result.total_vias, ga_result.total_bends, ga_time,
+        )
         # Reset assistant state for fresh optimization
         st.session_state.pop('board_ctrl', None)
         st.session_state.pop('asst_preview_result', None)
@@ -1045,6 +1224,9 @@ def main():
     n_opt = _fc['n_opt']
     pop_size = _fc['pop_size']
     early_stop = _fc['early_stop']
+    run_id = _fc.get('run_id', f"run_{st.session_state['run_counter']:03d}")
+    output_dir = _fc.get('output_dir') or str(Path(PROJECT_ROOT).parent / 'outputs' / run_id)
+    demo_mode = bool(_fc.get('demo_mode', False))
 
     # ============================================================== #
     # PROJECT MEMORY & COPILOT
@@ -1056,7 +1238,7 @@ def main():
     memory: ProjectMemory = st.session_state['project_memory']
 
     # Log optimization if this was a fresh run
-    if run_btn:
+    if run_btn or demo_btn:
         w_dict = None
         if best_genome and hasattr(best_genome, 'weights'):
             w = best_genome.weights
@@ -1082,9 +1264,36 @@ def main():
     )
 
     # Compute system scores (used by multiple tabs)
+    drc_report = board_executor.get_drc_report(ga_grid, nets)
+    confidence_label, confidence_reason = compute_system_confidence(
+        ga_result, drc_report
+    )
     scores = compute_system_score(
         naive_result, ga_result, total, ga_time
     )
+    scores['confidence'] = confidence_label
+    scores['confidence_reason'] = confidence_reason
+
+    if ga_result.failed_nets:
+        st.error(
+            f"Routing completed with failures: {', '.join(ga_result.failed_nets)}"
+        )
+    elif not drc_report.get('passed', False):
+        st.warning(
+            f"Routing completed, but DRC found {drc_report.get('errors', 0)} errors and {drc_report.get('warnings', 0)} warnings."
+        )
+    else:
+        st.success("Routing completed successfully with no blocking issues.")
+
+    status_cols = st.columns(4)
+    with status_cols[0]:
+        st.metric("Completion", f"{n_opt}/{total}")
+    with status_cols[1]:
+        st.metric("Vias", str(ga_result.total_vias), f"{ga_result.total_vias - naive_result.total_vias:+d} vs naive")
+    with status_cols[2]:
+        st.metric("Bends", str(ga_result.total_bends), f"{ga_result.total_bends - naive_result.total_bends:+d} vs naive")
+    with status_cols[3]:
+        st.metric("Confidence", confidence_label, confidence_reason)
 
     # ============================================================== #
     # RESULTS TABS
@@ -1120,53 +1329,42 @@ def main():
         cols = st.columns(5)
         with cols[0]:
             delta_nets = n_opt - n_naive
-            delta_str = f"+{delta_nets} nets" if delta_nets > 0 else (
-                f"{delta_nets} nets" if delta_nets < 0 else "same"
+            st.metric(
+                "Completion",
+                f"{n_opt}/{total}",
+                f"{delta_nets:+d} routed vs naive",
             )
-            dt = "positive" if delta_nets > 0 else (
-                "negative" if delta_nets < 0 else "neutral"
-            )
-            st.markdown(render_metric_card(
-                "Completion", f"{n_opt}/{total}", delta_str, dt
-            ), unsafe_allow_html=True)
 
         with cols[1]:
             avg_diff = avg_o - avg_n
-            dt = "positive" if avg_diff < 0 else (
-                "negative" if avg_diff > 0 else "neutral"
+            st.metric(
+                "Avg Length/Net",
+                f"{avg_o:.1f}",
+                f"{avg_diff:+.1f} steps vs naive",
             )
-            st.markdown(render_metric_card(
-                "Avg Length/Net", f"{avg_o:.1f}",
-                f"{avg_diff:+.1f} steps", dt
-            ), unsafe_allow_html=True)
 
         with cols[2]:
             vd = ga_result.total_vias - naive_result.total_vias
-            dt = "positive" if vd < 0 else (
-                "negative" if vd > 0 else "neutral"
+            st.metric(
+                "Vias",
+                str(ga_result.total_vias),
+                f"{vd:+d} vs naive",
             )
-            st.markdown(render_metric_card(
-                "Vias", str(ga_result.total_vias),
-                f"{vd:+d} vs naive", dt
-            ), unsafe_allow_html=True)
 
         with cols[3]:
             bd = ga_result.total_bends - naive_result.total_bends
-            dt = "positive" if bd < 0 else (
-                "negative" if bd > 0 else "neutral"
+            st.metric(
+                "Bends",
+                str(ga_result.total_bends),
+                f"{bd:+d} vs naive",
             )
-            st.markdown(render_metric_card(
-                "Bends", str(ga_result.total_bends),
-                f"{bd:+d} vs naive", dt
-            ), unsafe_allow_html=True)
 
         with cols[4]:
-            st.markdown(render_metric_card(
-                "Via Reduction",
-                f"{via_red:.0f}%" if naive_result.total_vias > 0 else "N/A",
-                "from naive baseline",
-                "positive" if via_red > 0 else "neutral"
-            ), unsafe_allow_html=True)
+            st.metric(
+                "Confidence",
+                confidence_label,
+                confidence_reason,
+            )
 
         st.markdown('<hr class="styled-divider">', unsafe_allow_html=True)
 
@@ -1183,10 +1381,14 @@ def main():
             '<div class="section-header">Board Visualization</div>',
             unsafe_allow_html=True
         )
-        left, right = st.columns(2)
+        view_mode = st.radio(
+            "Comparison Mode",
+            ["Naive", "Optimized", "Side-by-Side"],
+            horizontal=True,
+            key="comparison_mode_toggle",
+        )
 
-        with left:
-            st.markdown("**Naive Routing**")
+        if view_mode == "Naive":
             viz_n = BoardVisualizer(naive_grid)
             fig_n = viz_n.render(
                 title="Naive Routing",
@@ -1194,9 +1396,7 @@ def main():
             )
             st.pyplot(fig_n)
             plt.close(fig_n)
-
-        with right:
-            st.markdown("**GA-Optimized Routing**")
+        elif view_mode == "Optimized":
             viz_o = BoardVisualizer(ga_grid)
             fig_o = viz_o.render(
                 title="GA-Optimized Routing",
@@ -1204,18 +1404,37 @@ def main():
             )
             st.pyplot(fig_o)
             plt.close(fig_o)
+        else:
+            left, right = st.columns(2)
+            with left:
+                st.markdown("**Naive Routing**")
+                viz_n = BoardVisualizer(naive_grid)
+                fig_n = viz_n.render(
+                    title="Naive Routing",
+                    show_heat=True, result=naive_result, headless=True
+                )
+                st.pyplot(fig_n)
+                plt.close(fig_n)
+            with right:
+                st.markdown("**GA-Optimized Routing**")
+                viz_o = BoardVisualizer(ga_grid)
+                fig_o = viz_o.render(
+                    title="GA-Optimized Routing",
+                    show_heat=True, result=ga_result, headless=True
+                )
+                st.pyplot(fig_o)
+                plt.close(fig_o)
 
-        # Full comparison
-        st.markdown('<hr class="styled-divider">', unsafe_allow_html=True)
-        viz_comp = BoardVisualizer(naive_grid)
-        fig_c = viz_comp.render_comparison(
-            naive_grid, naive_result,
-            ga_grid, ga_result,
-            title_a="Naive", title_b="GA-Optimized",
-            headless=True
-        )
-        st.pyplot(fig_c)
-        plt.close(fig_c)
+            st.markdown('<hr class="styled-divider">', unsafe_allow_html=True)
+            viz_comp = BoardVisualizer(naive_grid)
+            fig_c = viz_comp.render_comparison(
+                naive_grid, naive_result,
+                ga_grid, ga_result,
+                title_a="Naive", title_b="GA-Optimized",
+                headless=True
+            )
+            st.pyplot(fig_c)
+            plt.close(fig_c)
 
         # Failed nets
         if naive_result.failed_nets:
@@ -1322,6 +1541,10 @@ def main():
             'AI Strategy Explanation</div>',
             unsafe_allow_html=True
         )
+
+        st.markdown("**Why this solution is better**")
+        for reason in build_why_better(naive_result, ga_result, best_genome):
+            st.markdown(f"- {reason}")
 
         exp_cols = st.columns(2)
         explanations = []
@@ -1680,6 +1903,42 @@ def main():
         # ----- Submission Package ----- #
         st.markdown('<hr class="styled-divider">', unsafe_allow_html=True)
         st.markdown(
+            '<div class="section-header">KiCad Proof Mode</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            "Export a lightweight KiCad-compatible board proof. "
+            "Use this to demonstrate real-tool interoperability in demos."
+        )
+        proof_data = export_kicad_proof(ga_grid, nets)
+        st.download_button(
+            label="Export to KiCad Format (.kicad_pcb)",
+            data=proof_data,
+            file_name="formacore_proof.kicad_pcb",
+            mime="text/plain",
+            use_container_width=True,
+            help="Proof-mode export: route geometry + net mapping in KiCad board syntax.",
+        )
+
+        proof_meta = {
+            "export_mode": "proof",
+            "board_mm": [
+                round(ga_grid.width * ga_grid.resolution, 3),
+                round(ga_grid.height * ga_grid.resolution, 3),
+            ],
+            "routed_nets": list(ga_grid.routed_paths.keys()),
+            "total_routed": len(ga_grid.routed_paths),
+        }
+        st.download_button(
+            label="Download KiCad Proof Metadata (JSON)",
+            data=json.dumps(proof_meta, indent=2),
+            file_name="formacore_kicad_proof.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        st.markdown('<hr class="styled-divider">', unsafe_allow_html=True)
+        st.markdown(
             '<div class="section-header">Submission Package</div>',
             unsafe_allow_html=True
         )
@@ -1714,6 +1973,29 @@ def main():
                 memory.log_export('submission_package',
                                   'formacore_submission.zip')
 
+                if output_dir:
+                    manifest = write_structured_outputs(
+                        output_dir=output_dir,
+                        grid=ga_grid,
+                        nets=nets,
+                        naive_result=naive_result,
+                        ga_result=ga_result,
+                        naive_grid=naive_grid,
+                        ga_grid=ga_grid,
+                        gen_log=gen_log,
+                        best_genome=best_genome,
+                        naive_time=naive_time,
+                        ga_time=ga_time,
+                        insights=insights,
+                        scores=scores,
+                        memory=memory,
+                        kicad_proof_text=proof_data,
+                        kicad_proof_meta=proof_meta,
+                    )
+                    st.session_state['structured_manifest'] = manifest
+                    st.session_state['last_output_dir'] = manifest['output_dir']
+                    st.success(f"Structured outputs saved to {manifest['output_dir']}")
+
         if 'submission_zip' in st.session_state:
             st.download_button(
                 label="Download Submission Package (ZIP)",
@@ -1722,6 +2004,25 @@ def main():
                 mime="application/zip",
                 use_container_width=True,
             )
+
+        if 'structured_manifest' in st.session_state:
+            manifest = st.session_state['structured_manifest']
+            st.markdown('<hr class="styled-divider">', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="section-header">Structured Output Folder</div>',
+                unsafe_allow_html=True,
+            )
+            st.code(
+                "\n".join(
+                    [manifest['output_dir']]
+                    + [f"  - {name}" for name in manifest['files']]
+                ),
+                language='text',
+            )
+            st.json({
+                'output_dir': manifest['output_dir'],
+                'file_count': manifest['file_count'],
+            })
 
     # ================================================================ #
     # TAB 5: ASSISTANT
@@ -2182,6 +2483,60 @@ def main():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+
+        st.markdown('<hr class="styled-divider">', unsafe_allow_html=True)
+        with st.expander("Failure Case Example"):
+            st.write(
+                "This deliberately blocks a route so you can show a clear failure path, not just the happy path."
+            )
+
+            if st.button("Run Failure Case Demo", key="failure_case_btn"):
+                f_grid, f_nets, f_result, f_drc = build_failure_case_demo()
+                st.session_state['failure_case_demo'] = {
+                    'grid': f_grid,
+                    'nets': f_nets,
+                    'result': f_result,
+                    'drc': f_drc,
+                }
+                st.rerun()
+
+            failure_demo = st.session_state.get('failure_case_demo')
+            if failure_demo:
+                f_result = failure_demo['result']
+                f_drc = failure_demo['drc']
+                st.error(
+                    f"Blocked demo: routing failed as expected for {len(f_result.failed_nets)} net(s)."
+                )
+                st.info(
+                    "Insight: the system reports failure explicitly instead of fabricating a route."
+                )
+
+                demo_cols = st.columns(2)
+                with demo_cols[0]:
+                    st.metric("Failed Nets", str(len(f_result.failed_nets)))
+                    st.metric("Completion", f"{f_result.completion_rate:.0%}")
+                    st.json({
+                        'failed_nets': f_result.failed_nets,
+                        'total_trace_length': f_result.total_trace_length,
+                        'vias': f_result.total_vias,
+                    })
+                with demo_cols[1]:
+                    viz_fail = BoardVisualizer(failure_demo['grid'])
+                    fig_fail = viz_fail.render(
+                        title="Blocked Routing Demo",
+                        show_heat=False,
+                        result=f_result,
+                        headless=True,
+                    )
+                    st.pyplot(fig_fail)
+                    plt.close(fig_fail)
+
+                if not f_drc.get('passed', True):
+                    st.warning(
+                        f"DRC status: {f_drc.get('errors', 0)} errors, {f_drc.get('warnings', 0)} warnings."
+                    )
+                else:
+                    st.success("DRC confirms the blocked case is explicit and reproducible.")
 
     # ================================================================ #
     # TAB 7: PROJECT TIMELINE

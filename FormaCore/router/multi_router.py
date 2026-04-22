@@ -5,6 +5,7 @@ marking cells occupied after each.
 """
 from __future__ import annotations
 
+import logging
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
@@ -12,6 +13,9 @@ from typing import List, Dict, Optional, Tuple
 from core.grid import Grid, Net
 from router.astar import AStarRouter, Node
 from router.cost import CostWeights
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -76,8 +80,10 @@ class MultiNetRouter:
             if success and full_path:
                 paths[net.name] = full_path
                 self.grid.mark_trace(full_path, net.name)
+                logger.debug("Routed net %s with %d nodes", net.name, len(full_path))
             else:
                 failed.append(net.name)
+                logger.warning("Failed to route net %s", net.name)
 
         return self._compute_metrics(paths, failed, nets)
 

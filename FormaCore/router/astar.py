@@ -6,6 +6,7 @@ Manhattan movement only. Supports via transitions between layers.
 from __future__ import annotations
 
 import heapq
+import logging
 from typing import Optional, List, Tuple, Dict
 
 from router.cost import CostWeights, compute_cost
@@ -15,6 +16,9 @@ Node = Tuple[int, int, int]
 
 # 4-directional movement
 DIRECTIONS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+
+logger = logging.getLogger(__name__)
 
 
 class AStarRouter:
@@ -77,6 +81,11 @@ class AStarRouter:
                     counter += 1
 
         self._allowed = set()
+        if iterations >= max_iter:
+            logger.warning("A* reached max_iter=%d without routing net (%s -> %s)",
+                           max_iter, start, goal)
+        else:
+            logger.info("A* found no route for net (%s -> %s)", start, goal)
         return None  # no path found
 
     def _heuristic(self, node: Node, goal: Node) -> float:

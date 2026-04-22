@@ -5,9 +5,15 @@ Extracts components, net labels, and wire connectivity.
 """
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional, Any
+
+from errors import ParseError
+
+
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------ #
@@ -199,68 +205,74 @@ def _get_property(node: list, prop_name: str, default="") -> str:
 
 def parse_kicad_sch(text: str) -> KiSchematic:
     """Parse a .kicad_sch file and return a KiSchematic."""
-    tree = parse_sexpr(text)
-    sch = KiSchematic()
+    try:
+        tree = parse_sexpr(text)
+        sch = KiSchematic()
 
-    if not isinstance(tree, list) or tree[0] != 'kicad_sch':
-        raise ValueError("Not a valid kicad_sch file")
+        if not isinstance(tree, list) or not tree or tree[0] != 'kicad_sch':
+            raise ParseError("Not a valid kicad_sch file")
 
-    # Title block
-    tb = _find_child(tree, 'title_block')
-    if tb:
-        sch.title = _get_value(tb, 'title', '')
-        sch.company = _get_value(tb, 'company', '')
+        # Title block
+        tb = _find_child(tree, 'title_block')
+        if tb:
+            sch.title = _get_value(tb, 'title', '')
+            sch.company = _get_value(tb, 'company', '')
 
-    # Library symbols
-    lib_syms = _find_child(tree, 'lib_symbols')
-    if lib_syms:
-        for sym_node in _find_all(lib_syms, 'symbol'):
-            lib_id = sym_node[1] if len(sym_node) > 1 else ''
-            lib_sym = KiLibSymbol(lib_id=lib_id)
+        # Library symbols
+        lib_syms = _find_child(tree, 'lib_symbols')
+        if lib_syms:
+            for sym_node in _find_all(lib_syms, 'symbol'):
+                lib_id = sym_node[1] if len(sym_node) > 1 else ''
+                lib_sym = KiLibSymbol(lib_id=lib_id)
 
-            # Pins are in sub-symbols (e.g. "Symbol_1_1")
-            for sub in _find_all(sym_node, 'symbol'):
-                for pin_node in _find_all(sub, 'pin'):
-                    pin = _parse_lib_pin(pin_node)
-                    if pin:
-                        lib_sym.pins.append(pin)
+                # Pins are in sub-symbols (e.g. "Symbol_1_1")
+                for sub in _find_all(sym_node, 'symbol'):
+                    for pin_node in _find_all(sub, 'pin'):
+                        pin = _parse_lib_pin(pin_node)
+                        if pin:
+                            lib_sym.pins.append(pin)
 
-            sch.lib_symbols[lib_id] = lib_sym
+                sch.lib_symbols[lib_id] = lib_sym
 
-    # Component instances (top-level symbol nodes)
-    for sym_node in _find_all(tree, 'symbol'):
-        comp = _parse_component(sym_node)
-        if comp and comp.on_board:
-            sch.components.append(comp)
+        # Component instances (top-level symbol nodes)
+        for sym_node in _find_all(tree, 'symbol'):
+            comp = _parse_component(sym_node)
+            if comp and comp.on_board:
+                sch.components.append(comp)
 
-    # Wires
-    for wire_node in _find_all(tree, 'wire'):
-        wire = _parse_wire(wire_node)
-        if wire:
-            sch.wires.append(wire)
+        # Wires
+        for wire_node in _find_all(tree, 'wire'):
+            wire = _parse_wire(wire_node)
+            if wire:
+                sch.wires.append(wire)
 
-    # Labels (local)
-    for label_node in _find_all(tree, 'label'):
-        label = _parse_label(label_node, is_global=False)
-        if label:
-            sch.labels.append(label)
+        # Labels (local)
+        for label_node in _find_all(tree, 'label'):
+            label = _parse_label(label_node, is_global=False)
+            if label:
+                sch.labels.append(label)
 
-    # Global labels
-    for gl_node in _find_all(tree, 'global_label'):
-        label = _parse_label(gl_node, is_global=True)
-        if label:
-            sch.labels.append(label)
+        # Global labels
+        for gl_node in _find_all(tree, 'global_label'):
+            label = _parse_label(gl_node, is_global=True)
+            if label:
+                sch.labels.append(label)
 
-    # Junctions
-    for junc_node in _find_all(tree, 'junction'):
-        junc = _parse_junction(junc_node)
-        if junc:
-            sch.junctions.append(junc)
+        # Junctions
+        for junc_node in _find_all(tree, 'junction'):
+            junc = _parse_junction(junc_node)
+            if junc:
+                sch.junctions.append(junc)
 
-    # Build connectivity (net name -> component pins)
-    _build_netlist(sch)
+        # Build connectivity (net name -> component pins)
+        _build_netlist(sch)
 
-    return sch
+        return sch
+    except ParseError:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to parse KiCad schematic")
+        raise ParseError(f"Failed to parse KiCad schematic: {exc}") from exc
 
 
 # ------------------------------------------------------------------ #

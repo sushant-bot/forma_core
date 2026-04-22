@@ -479,7 +479,8 @@ def _analyze_convergence(
         ))
     elif total_gens >= max_possible * 0.95:
         # Check if still improving at the end
-        late_improvement = abs(best_scores[-1] - best_scores[-max(5, total_gens // 10)])
+        compare_back = min(max(5, total_gens // 10), total_gens - 1)
+        late_improvement = abs(best_scores[-1] - best_scores[-compare_back])
         if late_improvement > best_scores[-1] * 0.02:
             out.append(DesignInsight(
                 severity='warning',

@@ -246,6 +246,9 @@ python -m venv .venv
 # source .venv/bin/activate     # macOS/Linux
 
 pip install numpy matplotlib streamlit plotly pandas
+# or install from requirements files:
+# pip install -r requirements.txt
+# pip install -r requirements-dev.txt
 ```
 
 **Requirements:** Python 3.10+
@@ -258,6 +261,43 @@ pip install numpy matplotlib streamlit plotly pandas
 
 ```bash
 streamlit run FormaCore/ui/app.py
+```
+
+## Run Tests
+
+```bash
+python -m pytest -q tests
+```
+
+## Demo Flow (2 minutes)
+
+1. Click **Run Demo** to load the sample board and fast GA settings.
+2. Show **Naive** vs **Optimized** with the comparison toggle.
+3. Point to the **Why this solution is better** explainability bullets.
+4. Open **KiCad Proof Mode** and export the `.kicad_pcb` proof file.
+5. Show the **Confidence** indicator and the structured output folder.
+6. If needed, click **Replay Last Run** to restore the last cached optimization instantly.
+
+## Output Folder
+
+Exporting a run creates a structured folder like:
+
+```text
+outputs/
+    run_001/
+        naive.png
+        optimized.png
+        comparison.png
+        report.md
+        report.txt
+        traces.csv
+        metrics.json
+        insights.json
+        timeline.json
+        kicad_proof.kicad_pcb
+        kicad_proof.json
+        manifest.json
+        run.log
 ```
 
 ---

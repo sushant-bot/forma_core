@@ -6,12 +6,16 @@ No file I/O. No side effects beyond the passed-in grid.
 """
 from __future__ import annotations
 
+import logging
 from typing import Dict, Any, List, Optional, Tuple
 
 from core.grid import Grid, Component, Net, Layer
 from core.heat import HeatModel
 from router.cost import CostWeights
 from router.multi_router import MultiNetRouter, RoutingResult
+
+
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------ #
@@ -38,6 +42,14 @@ def place_component(grid: Grid, ref: str, x: int, y: int,
                     pins: Optional[List[Tuple[int, int]]] = None
                     ) -> Dict[str, Any]:
     """Place a new component on the board."""
+    if width <= 0 or height <= 0:
+        return _error("Component width and height must be > 0")
+    if layer < 0 or layer >= grid.num_layers:
+        return _error(f"Layer {layer} is out of range (0-{grid.num_layers - 1})")
+    if pins:
+        for pin_x, pin_y in pins:
+            if pin_x < 0 or pin_y < 0 or pin_x >= width or pin_y >= height:
+                return _error("Pin coordinates must lie inside the component footprint")
     if not grid.in_bounds(x, y):
         return _error(f"Position ({x},{y}) out of bounds")
     if not grid.in_bounds(x + width - 1, y + height - 1):
@@ -166,6 +178,12 @@ def route_all_nets(grid: Grid, nets: List[Net],
                    net_order: Optional[List[int]] = None
                    ) -> Dict[str, Any]:
     """Route all nets with given weights and order."""
+    if net_order is not None:
+        if len(net_order) != len(nets):
+            return _error("net_order length must equal number of nets")
+        if sorted(net_order) != list(range(len(nets))):
+            return _error("net_order must be a permutation of net indices")
+
     # Clear existing routes first
     for net_name in list(grid.routed_paths.keys()):
         grid.clear_net(net_name)
@@ -173,6 +191,12 @@ def route_all_nets(grid: Grid, nets: List[Net],
     w = weights or CostWeights()
     router = MultiNetRouter(grid, w)
     result = router.route_all(nets, net_order=net_order)
+
+    if result.failed_nets:
+        logger.warning("Routing completed with %d failed nets: %s",
+                       len(result.failed_nets), result.failed_nets)
+    else:
+        logger.info("Routing completed successfully for %d nets", len(nets))
 
     return _ok(
         routed=len(result.paths),

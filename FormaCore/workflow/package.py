@@ -10,6 +10,7 @@ import io
 import csv
 import json
 import zipfile
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import matplotlib
@@ -120,6 +121,116 @@ def prepare_submission(
             zf.writestr('timeline.json', memory.export_json())
 
     return buf.getvalue()
+
+
+def write_structured_outputs(
+    output_dir: str | Path,
+    grid: Grid,
+    nets: List[Net],
+    naive_result: RoutingResult,
+    ga_result: RoutingResult,
+    naive_grid: Grid,
+    ga_grid: Grid,
+    gen_log: List[Dict[str, Any]],
+    best_genome: Any,
+    naive_time: float,
+    ga_time: float,
+    insights: List[DesignInsight],
+    scores: Dict[str, Any],
+    memory: Optional[ProjectMemory] = None,
+    kicad_proof_text: Optional[str] = None,
+    kicad_proof_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Write a structured output folder for the current run.
+
+    The folder is intentionally human-readable so judges can inspect
+    the run artifacts without unpacking a ZIP first.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    files: List[str] = []
+
+    def _save_text(name: str, content: str) -> None:
+        (out / name).write_text(content, encoding='utf-8')
+        files.append(name)
+
+    def _save_bytes(name: str, content: bytes) -> None:
+        (out / name).write_bytes(content)
+        files.append(name)
+
+    md_report = generate_report(
+        grid, nets, naive_result, ga_result, gen_log,
+        best_genome, naive_time, ga_time, insights, scores,
+        fmt='markdown',
+    )
+    txt_report = generate_report(
+        grid, nets, naive_result, ga_result, gen_log,
+        best_genome, naive_time, ga_time, insights, scores,
+        fmt='text',
+    )
+
+    _save_text('report.md', md_report)
+    _save_text('report.txt', txt_report)
+    _save_bytes('naive.png', _render_board_png(naive_grid, 'Naive Routing'))
+    _save_bytes('optimized.png', _render_board_png(ga_grid, 'GA-Optimized Routing'))
+
+    comp_viz = BoardVisualizer(naive_grid)
+    comp_fig = comp_viz.render_comparison(
+        naive_grid, naive_result,
+        ga_grid, ga_result,
+        title_a='Naive', title_b='GA-Optimized',
+        headless=True,
+    )
+    comp_buf = io.BytesIO()
+    comp_fig.savefig(comp_buf, format='png', dpi=150, bbox_inches='tight')
+    plt.close(comp_fig)
+    comp_buf.seek(0)
+    _save_bytes('comparison.png', comp_buf.read())
+
+    _save_text('traces.csv', _build_traces_csv(ga_result))
+    _save_text(
+        'metrics.json',
+        _build_metrics_json(
+            grid, nets, naive_result, ga_result,
+            gen_log, naive_time, ga_time, scores,
+        ),
+    )
+
+    insights_data = [
+        {
+            'severity': ins.severity,
+            'category': ins.category,
+            'title': ins.title,
+            'message': ins.message,
+            'suggestion': ins.suggestion,
+        }
+        for ins in insights
+    ]
+    _save_text('insights.json', json.dumps(insights_data, indent=2))
+
+    if memory and memory.count > 0:
+        _save_text('timeline.json', memory.export_json())
+
+    run_log = out / 'run.log'
+    if run_log.exists():
+        files.append('run.log')
+
+    if kicad_proof_text:
+        _save_text('kicad_proof.kicad_pcb', kicad_proof_text)
+    if kicad_proof_meta:
+        _save_text('kicad_proof.json', json.dumps(kicad_proof_meta, indent=2))
+
+    manifest = {
+        'output_dir': str(out.resolve()),
+        'file_count': len(files),
+        'files': files,
+    }
+    _save_text('manifest.json', json.dumps(manifest, indent=2))
+    manifest['files'] = files + ['manifest.json']
+    manifest['file_count'] = len(manifest['files'])
+    return manifest
 
 
 # ------------------------------------------------------------------ #

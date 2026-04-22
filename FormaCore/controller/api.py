@@ -7,6 +7,7 @@ Called directly by the Streamlit UI. No network layer needed.
 """
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from typing import Dict, Any, List, Optional
 
@@ -15,6 +16,9 @@ from assistant.validator import validate_action, ValidationResult
 from executor.sandbox import run_in_sandbox, SandboxResult, generate_preview_image
 from executor.versioning import VersionManager
 from executor import executor
+
+
+logger = logging.getLogger(__name__)
 
 
 class BoardController:
@@ -54,10 +58,20 @@ class BoardController:
             }
 
         # 2. Run in sandbox
-        sandbox = run_in_sandbox(
-            self.grid, self.nets,
-            action_id, validation.cleaned
-        )
+        try:
+            sandbox = run_in_sandbox(
+                self.grid, self.nets,
+                action_id, validation.cleaned
+            )
+        except Exception as exc:
+            logger.exception("Sandbox preview failed for action %s", action_id)
+            self._pending_sandbox = None
+            self._pending_action_id = None
+            self._pending_payload = None
+            return {
+                "status": "error",
+                "msg": f"Preview failed: {exc}",
+            }
 
         # 3. Store pending state for apply
         self._pending_sandbox = sandbox
@@ -109,24 +123,32 @@ class BoardController:
                 "detail": self._pending_sandbox.action_result,
             }
 
-        # Apply to real board: replace grid state with sandbox result
-        sandbox_grid = self._pending_sandbox.preview_grid
+        try:
+            # Apply to real board: replace grid state with sandbox result
+            sandbox_grid = self._pending_sandbox.preview_grid
 
-        # Copy sandbox state to real grid
-        self.grid.occupied = sandbox_grid.occupied.copy()
-        self.grid.heat = sandbox_grid.heat.copy()
-        self.grid.congestion = sandbox_grid.congestion.copy()
-        self.grid.components = [deepcopy(c)
-                                for c in sandbox_grid.components]
-        self.grid.routed_paths = dict(sandbox_grid.routed_paths)
+            # Copy sandbox state to real grid
+            self.grid.occupied = sandbox_grid.occupied.copy()
+            self.grid.heat = sandbox_grid.heat.copy()
+            self.grid.congestion = sandbox_grid.congestion.copy()
+            self.grid.components = [deepcopy(c)
+                                    for c in sandbox_grid.components]
+            self.grid.routed_paths = dict(sandbox_grid.routed_paths)
 
-        # Commit version
-        version_num = self.versions.commit(
-            self.grid,
-            self._pending_action_id,
-            self._pending_payload,
-            self._pending_sandbox.action_result,
-        )
+            # Commit version
+            version_num = self.versions.commit(
+                self.grid,
+                self._pending_action_id,
+                self._pending_payload,
+                self._pending_sandbox.action_result,
+            )
+        except Exception as exc:
+            logger.exception("Failed to apply sandboxed action %s",
+                             self._pending_action_id)
+            return {
+                "status": "error",
+                "msg": f"Apply failed: {exc}",
+            }
 
         # Clear pending
         action_id = self._pending_action_id

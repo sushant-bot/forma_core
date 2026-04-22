@@ -5,9 +5,12 @@ prints metrics, and shows side-by-side visualization.
 """
 from __future__ import annotations
 
+import logging
 import sys
 import os
 import time
+
+import matplotlib.pyplot as plt
 
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -21,6 +24,10 @@ from ai.genome import Genome
 from ai.fitness import FitnessEvaluator, FitnessWeights
 from ai.ga import GeneticAlgorithm, GAConfig
 from visualize.plot import BoardVisualizer
+from config import APP_VERSION, DEFAULT_HEAT_SIGMA, DEFAULT_OUTPUT_ROOT, setup_logging
+
+
+logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------ #
@@ -219,8 +226,11 @@ def print_comparison(naive: RoutingResult, optimized: RoutingResult,
 # ------------------------------------------------------------------ #
 
 def main():
+    setup_logging(DEFAULT_OUTPUT_ROOT / "cli.log")
+    logger.info("Launching FormaCore CLI demo v%s", APP_VERSION)
+
     print("=" * 52)
-    print("  FormaCore AI — 2-Layer PCB Router")
+    print(f"  FormaCore AI v{APP_VERSION} — 2-Layer PCB Router")
     print("=" * 52)
 
     # 1. Create board
@@ -232,7 +242,7 @@ def main():
     print(f"Nets: {len(nets)}")
 
     # 2. Apply heat model
-    heat = HeatModel(sigma=10.0)
+    heat = HeatModel(sigma=DEFAULT_HEAT_SIGMA)
     heat.apply(grid)
     print(f"Heat model applied (peak: {heat.get_max_heat(grid):.3f})")
 
@@ -268,21 +278,30 @@ def main():
     print("\n--- Visualization ---")
 
     viz = BoardVisualizer(naive_grid)
-    viz.render(title="Naive Routing", show_heat=True,
-               result=naive_result,
-               save_path="naive_routing.png")
+    fig_n = viz.render(title="Naive Routing", show_heat=True,
+                       result=naive_result,
+                       save_path="naive_routing.png",
+                       headless=True)
+    if fig_n is not None:
+        plt.close(fig_n)
 
     viz_ga = BoardVisualizer(ga_grid)
-    viz_ga.render(title="GA-Optimized Routing", show_heat=True,
-                  result=ga_result,
-                  save_path="ga_routing.png")
+    fig_g = viz_ga.render(title="GA-Optimized Routing", show_heat=True,
+                          result=ga_result,
+                          save_path="ga_routing.png",
+                          headless=True)
+    if fig_g is not None:
+        plt.close(fig_g)
 
-    viz.render_comparison(
+    fig_c = viz.render_comparison(
         naive_grid, naive_result,
         ga_grid, ga_result,
         title_a="Naive", title_b="GA-Optimized",
         save_path="comparison.png",
+        headless=True,
     )
+    if fig_c is not None:
+        plt.close(fig_c)
 
     print("\nDone.")
 
